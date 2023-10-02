@@ -16,109 +16,129 @@
 
 ## Stable Diffusion XL pipeline in JAX
 
-In [sdxl_single.py](TODO: ) we give a simple example of how to write a text-to-image generation pipeline in JAX using [StabilityAI's Stable Diffusion XL](stabilityai/stable-diffusion-xl-base-1.0).
+Upon having access to a TPU VM (TPUs higher than version 3), you should first install
+a TPU-compatible version of JAX:
+```
+pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+Next, we can install [flax](https://github.com/google/flax) and the diffusers library:
+
+```
+pip install flax diffusers
+```
+
+In [sdxl_single.py](./sdxl_single.py) we give a simple example of how to write a text-to-image generation pipeline in JAX using [StabilityAI's Stable Diffusion XL](stabilityai/stable-diffusion-xl-base-1.0).
 
 Let's explain it step-by-step:
 
+**Imports and Setup**
+
 ```python
-# Show best practices for SDXL JAX
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.jax_utils import replicate
 from diffusers import FlaxStableDiffusionXLPipeline
 
-# Let's cache the model compilation, so that it doesn't take as long the next time around.
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.initialize_cache("/tmp/sdxl_cache")
 import time
 
 NUM_DEVICES = jax.device_count()
+```
 
-# 1. Let's start by downloading the model and loading it into our pipeline class
-# Adhering to JAX's functional approach, the model's parameters are returned seperatetely and
-# will have to be passed to the pipeline during inference
+First, we import the necessary libraries:
+- `jax` is provides the primitives for TPU operations
+- `flax.jax_utils` contains some useful utility functions for `Flax`, a neural network library built on top of JAX
+- `diffusers` has all the code that is relevant for SDXL.
+- We also initialize a cache to speed up the JAX model compilation.
+- We automatically determine the number of available TPU devices.
+
+**1. Downloading Model and Loading Pipeline**
+
+```python
 pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0", revision="refs/pr/95", split_head_dim=True
 )
+```
+Here, a pre-trained model `stable-diffusion-xl-base-1.0` from the namespace `stabilityai` is loaded. It returns a pipeline for inference and its parameters.
 
-# 2. We cast all parameters to bfloat16 EXCEPT the scheduler which we leave in
-# float32 to keep maximal precision
+**2. Casting Parameter Types**
+
+```python
 scheduler_state = params.pop("scheduler")
 params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
 params["scheduler"] = scheduler_state
+```
+This section adjusts the data types of the model parameters.
+We convert all parameters to `bfloat16` to speed-up the computation with model weights. 
+**Note** that the scheduler parameters are **not** converted to `blfoat16` as the loss 
+in precision is degrading the pipeline's performance too significantly.
 
-# 3. Next, we define the different inputs to the pipeline
-default_prompt = "a colorful photo of a castle in the middle of a forest with trees and bushes, by Ismail Inceoglu, shadows, high contrast, dynamic shading, hdr, detailed vegetation, digital painting, digital drawing, detailed painting, a detailed digital painting, gothic art, featured on deviantart"
-default_neg_prompt = "fog, grainy, purple"
+**3. Define Inputs to Pipeline**
+
+```python
+default_prompt = ...
+default_neg_prompt = ...
 default_seed = 33
 default_guidance_scale = 5.0
 default_num_steps = 25
+```
+Here, various default inputs for the pipeline are set, including the prompt, negative prompt, random seed, guidance scale, and the number of inference steps.
 
+**4. Tokenizing Inputs**
 
-# 4. In order to be able to compile the pipeline
-# all inputs have to be tensors or strings
-# Let's tokenize the prompt and negative prompt
+```python
 def tokenize_prompt(prompt, neg_prompt):
     prompt_ids = pipeline.prepare_inputs(prompt)
     neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)
     return prompt_ids, neg_prompt_ids
+```
+This function tokenizes the given prompts. It's essential because the text encoders of SDXL don't understand raw text; they work with numbers. Tokenization converts text to numbers.
 
+**5. Parallelization and Replication**
 
-# 5. To make full use of JAX's parallelization capabilities
-# the parameters and input tensors are duplicated across devices
-# To make sure every device generates a different image, we create
-# different seeds for each image. The model parameters won't change
-# during inference so we do not wrap them into a function
+```python
 p_params = replicate(params)
 
 def replicate_all(prompt_ids, neg_prompt_ids, seed):
-    p_prompt_ids = replicate(prompt_ids)
-    p_neg_prompt_ids = replicate(neg_prompt_ids)
-    rng = jax.random.PRNGKey(seed)
-    rng = jax.random.split(rng, NUM_DEVICES)
-    return p_prompt_ids, p_neg_prompt_ids, rng
+    ...
+```
+To utilize JAX's parallel capabilities, the parameters and input tensors are duplicated across devices. The `replicate_all` function also ensures that every device produces a different image by creating a unique random seed for each device.
 
+**6. Putting Everything Together**
 
-# 6. Let's now put it all together in a generate function
-def generate(
-    prompt,
-    negative_prompt,
-    seed=default_seed,
-    guidance_scale=default_guidance_scale,
-    num_inference_steps=default_num_steps,
-):
-    prompt_ids, neg_prompt_ids = tokenize_prompt(prompt, negative_prompt)
-    prompt_ids, neg_prompt_ids, rng = replicate_all(prompt_ids, neg_prompt_ids, seed)
-    images = pipeline(
-        prompt_ids,
-        p_params,
-        rng,
-        num_inference_steps=num_inference_steps,
-        neg_prompt_ids=neg_prompt_ids,
-        guidance_scale=guidance_scale,
-        jit=True,
-    ).images
+```python
+def generate(...):
+    ...
+```
+This function integrates all the steps to produce the desired outputs from the model. It takes in prompts, tokenizes them, replicates them across devices, runs them through the pipeline, and converts the images to a format that's more interpretable (PIL format).
 
-    # convert the images to PIL
-    images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])
-    return pipeline.numpy_to_pil(np.array(images))
+**7. Compilation Step**
 
-# 7. Remember that the first call will compile the function and hence be very slow. Let's run generate once
-# so that the pipeline call is compiled
+```python
 start = time.time()
 print(f"Compiling ...")
 generate(default_prompt, default_neg_prompt)
 print(f"Compiled in {time.time() - start}")
+```
+The initial run of the `generate` function will be slow because JAX compiles the function during this call. By running it once here, subsequent calls will be much faster. This section measures and prints the compilation time.
 
-# 8. Now the model forward pass will run very quickly, let's try it again
+**8. Fast Inference**
+
+```python
 start = time.time()
-prompt = "photo of a rhino dressed suit and tie sitting at a table in a bar with a bar stools, award winning photography, Elke vogelsang"
-neg_prompt = "cartoon, illustration, animation. face. male, female"
+prompt = ...
+neg_prompt = ...
 images = generate(prompt, neg_prompt)
 print(f"Inference in {time.time() - start}")
-
 ```
+Now that the function is compiled, this section shows how to use it for fast inference. It measures and prints the inference time.
+
+In summary, the code demonstrates how to load a pre-trained model using Flax and JAX, prepare it for inference, and run it efficiently using JAX's capabilities.
+
+## Ahead of Time (AOT) Compilation
 
 FlaxStableDiffusionXLPipeline takes care of parallelization across multiple devices using jit. Now let's build parallelization ourselves.
 
@@ -126,73 +146,15 @@ For this we will be using a JAX feature called [Ahead of Time](https://jax.readt
 
 In [sdxl_single_aot.py](./sdxl_single_aot.py) we give a simple example of how to write our own parallelization logic for text-to-image generation pipeline in JAX using [StabilityAI's Stable Diffusion XL](stabilityai/stable-diffusion-xl-base-1.0)
 
+We add a `aot_compile` function that compiles the `pipeline._generate` function 
+telling JAX which input arguments are static, that is, arguments that
+are known at compile time and won't change. In our case, it is num_inference_steps, 
+height, width and return_latents.
+
+Once the function is compiled, these parameters are ommited from future calls and 
+cannot be changed without modifying the code and recompiling.
+
 ```python
-import jax
-import jax.numpy as jnp
-import numpy as np
-from flax.jax_utils import replicate
-from diffusers import FlaxStableDiffusionXLPipeline
-from flax.training.common_utils import shard
-from jax import pmap
-
-# Let's cache the model compilation, so that it doesn't take as long the next time around.
-from jax.experimental.compilation_cache import compilation_cache as cc
-cc.initialize_cache("/tmp/sdxl_cache")
-
-import time
-
-NUM_DEVICES = jax.device_count()
-
-# 1. Let's start by downloading the model and loading it into our pipeline class
-# Adhering to JAX's functional approach, the model's parameters are returned seperatetely and
-# will have to be passed to the pipeline during inference
-pipeline, params = FlaxStableDiffusionXLPipeline.from_pretrained(
-     "stabilityai/stable-diffusion-xl-base-1.0", revision="refs/pr/95", split_head_dim=True
-)
-
-# 2. We cast all parameters to bfloat16 EXCEPT the scheduler which we leave in
-# float32 to keep maximal precision
-scheduler_state = params.pop("scheduler")
-params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), params)
-params["scheduler"] = scheduler_state
-
-# 3. Next, we define the different inputs to the pipeline
-default_prompt = "a colorful photo of a castle in the middle of a forest with trees and bushes, by Ismail Inceoglu, shadows, high contrast, dynamic shading, hdr, detailed vegetation, digital painting, digital drawing, detailed painting, a detailed digital painting, gothic art, featured on deviantart"
-default_neg_prompt = "fog, grainy, purple"
-default_seed = 33
-default_guidance_scale = 5.0
-default_num_steps = 25
-width=1024
-height=1024
-
-# 4. In order to be able to compile the pipeline
-# all inputs have to be tensors or strings
-# Let's tokenize the prompt and negative prompt
-def tokenize_prompt(prompt, neg_prompt):
-    prompt_ids = pipeline.prepare_inputs(prompt)
-    neg_prompt_ids = pipeline.prepare_inputs(neg_prompt)
-    return prompt_ids, neg_prompt_ids
-
-# 5. To make full use of JAX's parallelization capabilities
-# the parameters and input tensors are duplicated across devices
-# To make sure every device generates a different image, we create
-# different seeds for each image. The model parameters won't change
-# during inference so we do not wrap them into a function
-p_params = replicate(params)
-
-def replicate_all(prompt_ids, neg_prompt_ids, seed):
-    p_prompt_ids = replicate(prompt_ids)
-    p_neg_prompt_ids = replicate(neg_prompt_ids)
-    rng = jax.random.PRNGKey(seed)
-    rng = jax.random.split(rng, NUM_DEVICES)
-    return p_prompt_ids, p_neg_prompt_ids, rng
-
-# 6. To compile the pipeline._generate function, we must pass all parameters
-# to the function and tell JAX which are static arguments, that is, arguments that
-# are known at compile time and won't change. In our case, it is num_inference_steps, 
-# height, width and return_latents.
-# Once the function is compiled, these parameters are ommited from future calls and 
-# cannot be changed without modifying the code and recompiling.
 def aot_compile(
         prompt=default_prompt,
         negative_prompt=default_neg_prompt,
@@ -219,13 +181,19 @@ def aot_compile(
             neg_prompt_ids,
             False # return_latents
             ).compile()
+````
 
+Next we can compile the generate function by executing `aot_compile`.
+
+```python
 start = time.time()
 print("Compiling ...")
 p_generate = aot_compile()
 print(f"Compiled in {time.time() - start}")
+```
+And again we put everything together in a `generate` function.
 
-# 7. Let's now put it all together in a generate function.
+```python
 def generate(
     prompt,
     negative_prompt,
@@ -247,34 +215,29 @@ def generate(
     # convert the images to PIL
     images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])
     return pipeline.numpy_to_pil(np.array(images))
+```
 
-# 8. The first forward pass after AOT compilation still takes a while longer than
-# subsequent passes, this is because on the first pass, JAX uses Python dispatch, which
-# Fills the C++ dispatch cache.
-# When using jit, this extra step is done automatically, but when using AOT compilation, 
-# it doesn't happen until the function call is made.
+The first forward pass after AOT compilation still takes a while longer than
+subsequent passes, this is because on the first pass, JAX uses Python dispatch, which
+Fills the C++ dispatch cache.
+When using jit, this extra step is done automatically, but when using AOT compilation, 
+it doesn't happen until the function call is made.
+
+```python
 start = time.time()
 prompt = "photo of a rhino dressed suit and tie sitting at a table in a bar with a bar stools, award winning photography, Elke vogelsang"
 neg_prompt = "cartoon, illustration, animation. face. male, female"
 images = generate(prompt, neg_prompt)
 print(f"First inference in {time.time() - start}")
+```
 
-# 9. From this point forward, any calls to generate should result in a faster inference
-# time and it won't change.
+From this point forward, any calls to generate should result in a faster inference
+time and it won't change.
+
+```python
 start = time.time()
 prompt = "photo of a rhino dressed suit and tie sitting at a table in a bar with a bar stools, award winning photography, Elke vogelsang"
 neg_prompt = "cartoon, illustration, animation. face. male, female"
 images = generate(prompt, neg_prompt)
 print(f"Inference in {time.time() - start}")
 ```
-
-## Creating a TPU v5e VM
-
-To create a TPU v5e, follow this [guide](https://cloud.google.com/tpu/docs/v5e-inference#user-guide).
-
-## Build your SDXL server with TPUv5e and GKE
-
-- Wanna build your own application? What is needed? 
-- Explain cold starts, auto-scaling => GKE
-- Show step-by-step on how to implement a auto-scale GKE endpoint.
-TODO: All the code can live in `./sdxl_autoscale_gke.py`

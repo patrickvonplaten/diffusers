@@ -1,14 +1,19 @@
 # Show best practices for SDXL JAX
+import time
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.jax_utils import replicate
-from diffusers import FlaxStableDiffusionXLPipeline
 
 # Let's cache the model compilation, so that it doesn't take as long the next time around.
 from jax.experimental.compilation_cache import compilation_cache as cc
+
+from diffusers import FlaxStableDiffusionXLPipeline
+
+
 cc.initialize_cache("/tmp/sdxl_cache")
-import time
+
 
 NUM_DEVICES = jax.device_count()
 
@@ -49,6 +54,7 @@ def tokenize_prompt(prompt, neg_prompt):
 # during inference so we do not wrap them into a function
 p_params = replicate(params)
 
+
 def replicate_all(prompt_ids, neg_prompt_ids, seed):
     p_prompt_ids = replicate(prompt_ids)
     p_neg_prompt_ids = replicate(neg_prompt_ids)
@@ -78,13 +84,14 @@ def generate(
     ).images
 
     # convert the images to PIL
-    images = images.reshape((images.shape[0] * images.shape[1], ) + images.shape[-3:])
+    images = images.reshape((images.shape[0] * images.shape[1],) + images.shape[-3:])
     return pipeline.numpy_to_pil(np.array(images))
+
 
 # 7. Remember that the first call will compile the function and hence be very slow. Let's run generate once
 # so that the pipeline call is compiled
 start = time.time()
-print(f"Compiling ...")
+print("Compiling ...")
 generate(default_prompt, default_neg_prompt)
 print(f"Compiled in {time.time() - start}")
 
