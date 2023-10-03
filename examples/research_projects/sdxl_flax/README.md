@@ -25,7 +25,7 @@ pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_relea
 Next, we can install [flax](https://github.com/google/flax) and the diffusers library:
 
 ```
-pip install flax diffusers
+pip install flax diffusers transformers
 ```
 
 In [sdxl_single.py](./sdxl_single.py) we give a simple example of how to write a text-to-image generation pipeline in JAX using [StabilityAI's Stable Diffusion XL](stabilityai/stable-diffusion-xl-base-1.0).
