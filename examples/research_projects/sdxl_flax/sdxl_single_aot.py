@@ -138,3 +138,6 @@ prompt = "photo of a rhino dressed suit and tie sitting at a table in a bar with
 neg_prompt = "cartoon, illustration, animation. face. male, female"
 images = generate(prompt, neg_prompt)
 print(f"Inference in {time.time() - start}")
+
+for i, image in enumerate(images):
+    image.save(f"castle_{i}.png")
